@@ -13,7 +13,7 @@
 // PURE UI STATE VARIABLES
 // =============================================================================
 static AppScreen currentScreen = SCREEN_MENU;
-static bool showItemFormModal = false;
+static int eventsSubTab = 0; // 0 = Chaos Deck, 1 = Add/Edit SKU, 2 = Shopify Web Store Scraper
 static int editTargetIndex = -1;
 static int activeInput = 0;
 static char nameInput[50] = "\0";
@@ -26,14 +26,42 @@ static int nameCount = 0, qtyCount = 0, priceCount = 0, costCount = 0, maxCount 
 
 static int scrollIndex = 0;
 static int scrollHistory = 0;
+static int scrollAudit = 0;
 static bool fontFilterInitialized = false;
 
-static bool catalogShowGraph = false;
+// SCREEN_VIEW sub-modes: 0 = Table Catalog, 1 = Analytics Graph, 2 = Staff Discrepancy Audit
+static int catalogViewMode = 0;
 static int selectedGraphSku = 0;
 static bool showLinePrice = true;
 static bool showLineCost = true;
 static bool showLineSales = true;
 static bool showLineProfit = true;
+
+// Search & Simulated Barcode Scanner State
+static char searchQuery[48] = "\0";
+static int searchLen = 0;
+static bool searchBoxFocused = false;
+static float barcodeScanLaserFlash = 0.0f;
+
+// Staff Discrepancy Audit Tracker State
+static int selectedStaffIdx = 0;
+static int selectedReasonIdx = 0;
+static const char *staffDirectory[4] = {
+    "Nathan Doyle (Store Mgr)",
+    "Alan Leeder (Inv Lead)",
+    "Sarah O'Connor (Shift Lead)",
+    "Liam Kelly (Warehouse Ops)"};
+static const char *auditReasons[4] = {
+    "Shrinkage / Theft",
+    "Transit Cargo Damage",
+    "POS Scan Miss",
+    "Supplier Short-Ship"};
+
+// Online Store / Shopify Scraper State
+static char scraperUrlInput[128] = "www.keychron.com/products.json";
+static int scraperUrlLen = 30;
+static bool scraperBoxFocused = false;
+static char scraperStatusMsg[160] = "Ready: Enter any Shopify domain (/products.json) or pick a preset below.";
 
 // =============================================================================
 // HIGH-BRIGHTNESS, RAZOR-SHARP 1080P TYPOGRAPHY & RENDERING HELPERS
@@ -159,6 +187,62 @@ void DrawPillBadge(Rectangle rect, const char *text, Color accentColor, Color bg
 }
 
 // =============================================================================
+// 1D PROCEDURAL EAN-13 BARCODE GRAPHIC RENDERER
+// =============================================================================
+
+static void DrawSimulatedBarcode(Rectangle box, const char *barcode, Color barColor)
+{
+    DrawRectangleRounded(box, 0.15f, 6, (Color){12, 15, 22, 255});
+    DrawRectangleLinesEx(box, 1.0f, (Color){65, 78, 108, 200});
+
+    const char *code = (barcode != NULL && barcode[0] != '\0') ? barcode : "5391042000018";
+    int len = (int)strlen(code);
+
+    int startX = (int)box.x + 6;
+    int barTop = (int)box.y + 4;
+    int barH = (int)box.height - 18;
+    if (barH < 10)
+        barH = 10;
+
+    // Left guard bars
+    DrawRectangle(startX, barTop, 2, barH + 3, barColor);
+    DrawRectangle(startX + 4, barTop, 1, barH + 3, barColor);
+    int curX = startX + 8;
+
+    for (int i = 0; i < len && curX < (int)(box.x + box.width - 12); i++)
+    {
+        int d = (code[i] >= '0' && code[i] <= '9') ? (code[i] - '0') : (i % 10);
+        int w1 = (d % 3) + 1;
+        int gap1 = ((d + 1) % 2) + 1;
+        int w2 = ((d * 2) % 2) + 1;
+
+        DrawRectangle(curX, barTop, w1, barH, barColor);
+        curX += w1 + gap1;
+        if (curX + w2 < (int)(box.x + box.width - 10))
+        {
+            DrawRectangle(curX, barTop, w2, barH, barColor);
+            curX += w2 + 2;
+        }
+        if (i == 5 && curX < (int)(box.x + box.width - 14))
+        {
+            DrawRectangle(curX, barTop, 1, barH + 3, barColor);
+            curX += 3;
+        }
+    }
+
+    // Right guard bar
+    DrawRectangle((int)(box.x + box.width - 8), barTop, 2, barH + 3, barColor);
+
+    if (barcodeScanLaserFlash > 0.0f)
+    {
+        int laserY = barTop + (barH / 2);
+        DrawLineEx((Vector2){box.x + 2, (float)laserY}, (Vector2){box.x + box.width - 2, (float)laserY}, 2.5f, (Color){255, 65, 85, 240});
+    }
+
+    DrawTextCenteredInBox((Rectangle){box.x, box.y + box.height - 14, box.width, 13}, code, 11, (Color){215, 228, 248, 255});
+}
+
+// =============================================================================
 // MASTER SIMULATION INITIALIZER & STEP ROUTER
 // =============================================================================
 
@@ -168,18 +252,27 @@ void InitSimulation(InventoryItem inventory[], int *itemCount)
     {
         SeedDefaultInventory(inventory, itemCount);
     }
+    LoadAuditLogs();
     InitSuppliers();
     InitEvents();
     InitAiEconomy(inventory, itemCount);
     InitTelemetry(inventory);
     InitArena();
 
-    PushNotification("NDAL HARDCORE ECONOMY: Modular Architecture, Lean Shelves & Heavy Upkeep Active.", 0);
+    PushNotification("NDAL HARDCORE ECONOMY: Barcodes, Discrepancy Audit & Store Scraper Online.", 0);
 }
 
 static void StepAllSimulationModules(float dt, InventoryItem inventory[], int *itemCount, OrderRecord orders[], int *orderCount)
 {
-    UpdateNotificationTimers(GetFrameTime());
+    float rawDt = GetFrameTime();
+    UpdateNotificationTimers(rawDt);
+    if (barcodeScanLaserFlash > 0.0f)
+    {
+        barcodeScanLaserFlash -= rawDt;
+        if (barcodeScanLaserFlash < 0.0f)
+            barcodeScanLaserFlash = 0.0f;
+    }
+
     if (dt <= 0.0f)
         return;
 
@@ -258,7 +351,7 @@ static void DrawProductAnalyticsGraph(Rectangle centerArena, Vector2 mousePoint,
     }
 
     DrawDashboardCard(skuPill, cardDark, highlightCyan, 0.3f, false);
-    DrawTextCenteredInBox(skuPill, TextFormat("SKU #%d: %s  |  Stock: %d / %d (+%d Transit)", sku->id, sku->name, sku->quantity, sku->maxStock, sku->inTransit), 18, textYellow);
+    DrawTextCenteredInBox(skuPill, TextFormat("SKU #%d: %s [%s] | Stock: %d/%d", sku->id, sku->name, sku->barcode, sku->quantity, sku->maxStock), 16, textYellow);
 
     DrawDashboardCard(nextBtn, hNext ? cardHover : inputDark, highlightCyan, 0.3f, hNext);
     DrawTextCenteredInBox(nextBtn, "NEXT SKU >", 15, textYellow);
@@ -481,6 +574,229 @@ static void DrawProductAnalyticsGraph(Rectangle centerArena, Vector2 mousePoint,
 }
 
 // =============================================================================
+// STAFF DISCREPANCY & STOCK AUDIT VIEW RENDERER
+// =============================================================================
+
+static void DrawStaffDiscrepancyAuditView(Rectangle centerArena, Vector2 mousePoint, int wheel, InventoryItem inventory[], int itemCount)
+{
+    Color bgDark = (Color){11, 13, 20, 255};
+    Color cardDark = (Color){22, 26, 38, 255};
+    Color cardHover = (Color){36, 42, 60, 255};
+    Color inputDark = (Color){15, 18, 28, 255};
+    Color textYellow = (Color){255, 255, 242, 255};
+    Color textDim = (Color){205, 218, 238, 255};
+    Color highlightCyan = (Color){35, 245, 255, 255};
+    Color highlightPurple = (Color){205, 135, 255, 255};
+    Color barRed = (Color){255, 80, 100, 255};
+    Color textGreen = (Color){55, 250, 155, 255};
+    Color warnOrange = (Color){255, 195, 45, 255};
+    Color gridLine = (Color){52, 60, 84, 255};
+
+    AiEconomyState *ai = GetAiEconomyState();
+
+    // 1. Staff & Audit Reason Control Strip
+    float stripY = centerArena.y + 68.0f;
+    Rectangle staffBtn = {centerArena.x + 24, stripY, 390, 42};
+    Rectangle reasonBtn = {centerArena.x + 428, stripY, 320, 42};
+    Rectangle simShrinkBtn = {centerArena.x + 762, stripY, 205, 42};
+    Rectangle recAllBtn = {centerArena.x + 980, stripY, 212, 42};
+
+    bool hStaff = CheckCollisionPointRec(mousePoint, staffBtn);
+    bool hReason = CheckCollisionPointRec(mousePoint, reasonBtn);
+    bool hSimSh = CheckCollisionPointRec(mousePoint, simShrinkBtn);
+    bool hRecAll = CheckCollisionPointRec(mousePoint, recAllBtn);
+
+    DrawDashboardCard(staffBtn, hStaff ? cardHover : inputDark, highlightCyan, 0.28f, hStaff);
+    DrawTextCenteredInBox(staffBtn, TextFormat("AUDITOR: %s", staffDirectory[selectedStaffIdx]), 15, highlightCyan);
+    if (hStaff && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+    {
+        selectedStaffIdx = (selectedStaffIdx + 1) % 4;
+    }
+
+    DrawDashboardCard(reasonBtn, hReason ? cardHover : inputDark, highlightPurple, 0.28f, hReason);
+    DrawTextCenteredInBox(reasonBtn, TextFormat("REASON: %s", auditReasons[selectedReasonIdx]), 15, textYellow);
+    if (hReason && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+    {
+        selectedReasonIdx = (selectedReasonIdx + 1) % 4;
+    }
+
+    DrawDashboardCard(simShrinkBtn, hSimSh ? warnOrange : inputDark, warnOrange, 0.28f, hSimSh);
+    DrawTextCenteredInBox(simShrinkBtn, "SIMULATE SHRINKAGE", 14, hSimSh ? bgDark : warnOrange);
+    if (hSimSh && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+    {
+        int r = PickRandomActiveInventoryIndex(inventory);
+        if (inventory[r].isActive && inventory[r].quantity >= 3)
+        {
+            int lost = GetRandomValue(2, 5);
+            if (lost > inventory[r].quantity)
+                lost = inventory[r].quantity;
+            inventory[r].quantity -= lost;
+            SaveInventory(inventory, itemCount);
+            PushNotification(TextFormat("UNRECORDED SHRINKAGE: -%d u missing from %s (Book: %d vs Shelf: %d)",
+                                        lost, inventory[r].name, inventory[r].expectedQty, inventory[r].quantity),
+                             2);
+        }
+    }
+
+    int totalVarUnits = 0;
+    int discSkus = GetTotalDiscrepancyCount(inventory, &totalVarUnits);
+
+    DrawDashboardCard(recAllBtn, (hRecAll && discSkus > 0) ? textGreen : inputDark, discSkus > 0 ? textGreen : gridLine, 0.28f, hRecAll);
+    DrawTextCenteredInBox(recAllBtn, discSkus > 0 ? TextFormat("RECONCILE ALL (%d)", discSkus) : "ALL STOCK RECONCILED", 14, (hRecAll && discSkus > 0) ? bgDark : (discSkus > 0 ? textGreen : textDim));
+    if (hRecAll && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && discSkus > 0)
+    {
+        int logged = 0;
+        for (int i = 0; i < MAX_ITEMS; i++)
+        {
+            if (inventory[i].isActive && inventory[i].quantity != inventory[i].expectedQty)
+            {
+                RecordStaffAudit(staffDirectory[selectedStaffIdx], &inventory[i], auditReasons[selectedReasonIdx], ai->simTime);
+                logged++;
+            }
+        }
+        SaveInventory(inventory, itemCount);
+        PushNotification(TextFormat("%s reconciled %d SKU discrepancies into audit_log.csv.", staffDirectory[selectedStaffIdx], logged), 1);
+    }
+
+    // 2. Live Shelf vs. Book Discrepancy Inspection Table (Top Half)
+    int yOff = (int)centerArena.y + 124;
+    DrawTextTruncated("PRODUCT & EAN-13 BARCODE", (int)centerArena.x + 32, yOff, 14, 300, textDim);
+    DrawTextTruncated("BOOK (EXPECTED)", (int)centerArena.x + 360, yOff, 14, 150, textDim);
+    DrawTextTruncated("PHYSICAL COUNT", (int)centerArena.x + 520, yOff, 14, 160, textDim);
+    DrawTextTruncated("VARIANCE & LOSS", (int)centerArena.x + 695, yOff, 14, 210, textDim);
+    DrawTextTruncated("STAFF AUDIT ACTION", (int)centerArena.x + 935, yOff, 14, 240, textDim);
+    yOff += 22;
+    DrawLine((int)centerArena.x + 24, yOff, (int)centerArena.x + 1192, yOff, gridLine);
+    yOff += 8;
+
+    int drawnRows = 0;
+    for (int i = 0; i < MAX_ITEMS && drawnRows < 5; i++)
+    {
+        if (!inventory[i].isActive)
+            continue;
+        if (!ItemMatchesSearch(&inventory[i], searchQuery))
+            continue;
+
+        int diff = inventory[i].quantity - inventory[i].expectedQty;
+        Rectangle row = {centerArena.x + 24, (float)yOff, 1168, 56};
+        Color borderCol = (diff < 0) ? barRed : ((diff > 0) ? warnOrange : gridLine);
+        DrawDashboardCard(row, (drawnRows % 2 == 0) ? cardDark : inputDark, borderCol, 0.15f, false);
+
+        DrawSimulatedBarcode((Rectangle){row.x + 10, row.y + 6, 112, 44}, inventory[i].barcode, highlightCyan);
+        DrawTextTruncated(inventory[i].name, (int)row.x + 132, yOff + 10, 17, 210, textYellow);
+        DrawTextTruncated(TextFormat("Unit Cost: EUR %.1f", inventory[i].orderCost), (int)row.x + 132, yOff + 32, 13, 210, textDim);
+
+        DrawTextTruncated(TextFormat("%d units", inventory[i].expectedQty), (int)centerArena.x + 365, yOff + 18, 18, 130, textYellow);
+
+        // Physical Count with manual +/- audit buttons
+        Rectangle minusBtn = {centerArena.x + 520, (float)yOff + 12, 32, 32};
+        Rectangle plusBtn = {centerArena.x + 628, (float)yOff + 12, 32, 32};
+        bool hMin = CheckCollisionPointRec(mousePoint, minusBtn);
+        bool hPls = CheckCollisionPointRec(mousePoint, plusBtn);
+
+        DrawDashboardCard(minusBtn, hMin ? barRed : bgDark, gridLine, 0.3f, hMin);
+        DrawTextCenteredInBox(minusBtn, "-", 18, textYellow);
+        if (hMin && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && inventory[i].quantity > 0)
+        {
+            inventory[i].quantity--;
+        }
+
+        DrawTextCenteredInBox((Rectangle){centerArena.x + 554, (float)yOff + 12, 72, 32}, TextFormat("%d u", inventory[i].quantity), 18, diff != 0 ? warnOrange : textGreen);
+
+        DrawDashboardCard(plusBtn, hPls ? textGreen : bgDark, gridLine, 0.3f, hPls);
+        DrawTextCenteredInBox(plusBtn, "+", 18, textYellow);
+        if (hPls && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && inventory[i].quantity < inventory[i].maxStock)
+        {
+            inventory[i].quantity++;
+        }
+
+        if (diff == 0)
+        {
+            DrawPillBadge((Rectangle){centerArena.x + 695, (float)yOff + 14, 185, 28}, "MATCH (0 VARIANCE)", textGreen, bgDark);
+        }
+        else
+        {
+            float eurImpact = (float)diff * inventory[i].orderCost;
+            DrawPillBadge((Rectangle){centerArena.x + 695, (float)yOff + 14, 210, 28},
+                          TextFormat("%+d u (%+.0f EUR)", diff, eurImpact),
+                          diff < 0 ? barRed : warnOrange, bgDark);
+        }
+
+        Rectangle logBtn = {centerArena.x + 925, (float)yOff + 10, 252, 36};
+        bool hLog = CheckCollisionPointRec(mousePoint, logBtn);
+        Color btnCol = (diff != 0) ? highlightCyan : textDim;
+        DrawDashboardCard(logBtn, (hLog && diff != 0) ? highlightCyan : bgDark, btnCol, 0.28f, hLog && diff != 0);
+        DrawTextCenteredInBox(logBtn, diff != 0 ? "RECONCILE & LOG VARIANCE" : "VERIFIED OK", 14, (hLog && diff != 0) ? bgDark : btnCol);
+
+        if (hLog && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && diff != 0)
+        {
+            RecordStaffAudit(staffDirectory[selectedStaffIdx], &inventory[i], auditReasons[selectedReasonIdx], ai->simTime);
+            SaveInventory(inventory, itemCount);
+            PushNotification(TextFormat("AUDIT LOGGED: %s reconciled %s (%+d u, %s)",
+                                        staffDirectory[selectedStaffIdx], inventory[i].name, diff, auditReasons[selectedReasonIdx]),
+                             1);
+        }
+
+        yOff += 62;
+        drawnRows++;
+    }
+
+    // 3. Persistent Staff Discrepancy Audit Log History (Bottom Panel)
+    int logCount = 0;
+    AuditRecord *logs = GetAuditLogs(&logCount);
+
+    Rectangle logCard = {centerArena.x + 24, centerArena.y + 476, 1168, 322};
+    DrawDashboardCard(logCard, inputDark, highlightPurple, 0.05f, false);
+    DrawTextTruncated(TextFormat("STAFF DISCREPANCY AUDIT LOG HISTORY (%d RECORDS SAVED IN audit_log.csv)", logCount),
+                      (int)logCard.x + 20, (int)logCard.y + 12, 16, 820, highlightPurple);
+
+    if (wheel != 0 && CheckCollisionPointRec(mousePoint, logCard))
+    {
+        scrollAudit -= wheel;
+    }
+    if (scrollAudit > logCount - 5)
+        scrollAudit = logCount - 5;
+    if (scrollAudit < 0)
+        scrollAudit = 0;
+
+    int ly = (int)logCard.y + 42;
+    DrawTextTruncated("AUDIT ID & TIME", (int)logCard.x + 20, ly, 13, 140, textDim);
+    DrawTextTruncated("STAFF AUDITOR", (int)logCard.x + 170, ly, 13, 210, textDim);
+    DrawTextTruncated("PRODUCT & BARCODE", (int)logCard.x + 395, ly, 13, 270, textDim);
+    DrawTextTruncated("BOOK -> COUNTED", (int)logCard.x + 680, ly, 13, 160, textDim);
+    DrawTextTruncated("VARIANCE / EUR", (int)logCard.x + 850, ly, 13, 140, textDim);
+    DrawTextTruncated("REASON LOGGED", (int)logCard.x + 1000, ly, 13, 155, textDim);
+    ly += 20;
+    DrawLine((int)logCard.x + 16, ly, (int)(logCard.x + logCard.width - 16), ly, gridLine);
+    ly += 8;
+
+    if (logCount == 0)
+    {
+        DrawTextCenteredInBox((Rectangle){logCard.x, (float)ly + 40, logCard.width, 40},
+                              "No discrepancies reconciled yet. Trigger 'Warehouse Shrinkage' or 'Simulate Shrinkage' above to test Staff Auditing!",
+                              16, textDim);
+    }
+    else
+    {
+        int drawnLogs = 0;
+        for (int idx = logCount - 1 - scrollAudit; idx >= 0 && drawnLogs < 5; idx--)
+        {
+            AuditRecord *r = &logs[idx];
+            DrawTextTruncated(TextFormat("#%d (T=%.0fs)", r->auditId, r->timestamp), (int)logCard.x + 20, ly + 6, 15, 140, highlightCyan);
+            DrawTextTruncated(r->staffName, (int)logCard.x + 170, ly + 6, 15, 215, textYellow);
+            DrawTextTruncated(TextFormat("%s [%s]", r->itemName, r->barcode), (int)logCard.x + 395, ly + 6, 15, 275, textYellow);
+            DrawTextTruncated(TextFormat("%d u  ->  %d u", r->expectedQty, r->countedQty), (int)logCard.x + 680, ly + 6, 15, 155, textDim);
+            DrawTextTruncated(TextFormat("%+d u (%+.0f EUR)", r->discrepancy, r->financialImpact),
+                              (int)logCard.x + 850, ly + 6, 15, 140, r->discrepancy < 0 ? barRed : warnOrange);
+            DrawPillBadge((Rectangle){logCard.x + 995, (float)ly + 2, 155, 24}, r->reason, highlightPurple, bgDark);
+
+            ly += 46;
+            drawnLogs++;
+        }
+    }
+}
+
+// =============================================================================
 // MAIN 1920x1080 PERIMETER HUD & SCREEN ROUTER
 // =============================================================================
 
@@ -525,6 +841,8 @@ void UpdateAndDrawUI(InventoryItem inventory[], int *itemCount, OrderRecord orde
     int activeStock = GetActiveSkuCount(inventory);
     int lowStockCount = 0;
     int totalUnits = 0, totalMaxCapacity = 0, inTransitUnits = 0, pendingOrders = 0;
+    int discrepancyUnitTotal = 0;
+    int discrepancySkuCount = GetTotalDiscrepancyCount(inventory, &discrepancyUnitTotal);
 
     for (int i = 0; i < MAX_ITEMS; i++)
     {
@@ -605,12 +923,18 @@ void UpdateAndDrawUI(InventoryItem inventory[], int *itemCount, OrderRecord orde
     DrawRectangleRounded((Rectangle){kpi3.x + 16, kpi3.y + 54, 292 * (ai->customerSatisfaction / 100.0f), 8}, 1.0f, 6, satColor);
 
     bool hk4 = CheckCollisionPointRec(mousePoint, kpi4);
-    DrawDashboardCard(kpi4, hk4 ? cardHover : inputDark, lowStockCount > 0 ? barRed : highlightPurple, 0.22f, hk4);
-    DrawTextTruncated(TextFormat("CATALOG (%d/%d SKUs) & TRANSIT", activeStock, MAX_STORE_SKUS), (int)kpi4.x + 16, (int)kpi4.y + 8, 13, 285, textDim);
-    DrawTextTruncated(TextFormat("%d Low SKUs  |  +%d In Transit", lowStockCount, inTransitUnits), (int)kpi4.x + 16, (int)kpi4.y + 26, 20, 285, lowStockCount > 0 ? barRed : textYellow);
-    DrawTextTruncated(TextFormat("Sold: %d units  |  Missed: %d", ai->totalUnitsSold, ai->missedSalesCount), (int)kpi4.x + 16, (int)kpi4.y + 52, 14, 285, textGreen);
+    DrawDashboardCard(kpi4, hk4 ? cardHover : inputDark, (discrepancySkuCount > 0 || lowStockCount > 0) ? barRed : highlightPurple, 0.22f, hk4);
+    DrawTextTruncated(TextFormat("CATALOG (%d/%d) & DISCREPANCIES", activeStock, MAX_STORE_SKUS), (int)kpi4.x + 16, (int)kpi4.y + 8, 13, 285, textDim);
+    DrawTextTruncated(discrepancySkuCount > 0
+                          ? TextFormat("%d SKU Discrepancies (%d u)!", discrepancySkuCount, discrepancyUnitTotal)
+                          : TextFormat("%d Low SKUs  |  +%d In Transit", lowStockCount, inTransitUnits),
+                      (int)kpi4.x + 16, (int)kpi4.y + 26, 19, 285, (discrepancySkuCount > 0 || lowStockCount > 0) ? barRed : textYellow);
+    DrawTextTruncated("Click to Audit Discrepancies / Search", (int)kpi4.x + 16, (int)kpi4.y + 52, 13, 285, discrepancySkuCount > 0 ? warnOrange : textGreen);
     if (hk4 && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
-        currentScreen = SCREEN_ORDER_HISTORY;
+    {
+        currentScreen = SCREEN_VIEW;
+        catalogViewMode = (discrepancySkuCount > 0) ? 2 : 0;
+    }
 
     // =========================================================================
     // 2. LEFT EDGE COMMAND & ADAPTIVE 1/2-COLUMN SHELF MONITOR (x: 16..336, y: 120..936)
@@ -621,9 +945,9 @@ void UpdateAndDrawUI(InventoryItem inventory[], int *itemCount, OrderRecord orde
     DrawTextCrisp("NDAL WORKSPACES", 32, 134, 15, highlightCyan);
     const char *navLabels[5] = {
         "Live Digital Twin Arena",
-        "Product Catalog & Graph",
+        "Catalog, Search & Audit",
         "Supplier Network & AI",
-        "Chaos Director Deck (8)",
+        "Chaos & Store Scraper",
         "Shipment Transit Log"};
     AppScreen navScreens[5] = {SCREEN_MENU, SCREEN_VIEW, SCREEN_ORDER, SCREEN_EVENTS, SCREEN_ORDER_HISTORY};
 
@@ -638,12 +962,16 @@ void UpdateAndDrawUI(InventoryItem inventory[], int *itemCount, OrderRecord orde
         DrawDashboardCard(navBtn, navBg, navBorder, 0.25f, isHover || isCurrent);
 
         DrawRectangleRounded((Rectangle){navBtn.x + 6, navBtn.y + 8, 4, 22}, 0.5f, 4, isCurrent ? highlightCyan : (isHover ? highlightPurple : textDim));
-        DrawTextTruncated(navLabels[n], (int)navBtn.x + 20, (int)navBtn.y + 10, 16, 260, isCurrent ? textYellow : textDim);
+        DrawTextTruncated(navLabels[n], (int)navBtn.x + 20, (int)navBtn.y + 10, 16, 230, isCurrent ? textYellow : textDim);
+
+        if (n == 1 && discrepancySkuCount > 0)
+        {
+            DrawPillBadge((Rectangle){navBtn.x + 236, navBtn.y + 8, 48, 22}, TextFormat("%d!", discrepancySkuCount), barRed, bgDark);
+        }
 
         if (isHover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
         {
             currentScreen = navScreens[n];
-            showItemFormModal = false;
             scrollIndex = 0;
         }
     }
@@ -690,9 +1018,10 @@ void UpdateAndDrawUI(InventoryItem inventory[], int *itemCount, OrderRecord orde
         bool hSku = CheckCollisionPointRec(mousePoint, skuBox);
         bool onSale = (inventory[i].saleTimer > 0.0f);
         bool isLow = (inventory[i].quantity <= inventory[i].minStock);
+        bool hasDisc = (inventory[i].quantity != inventory[i].expectedQty);
         float mPct = (ai->aiPriceMult[i] - 1.0f) * 100.0f;
 
-        Color sBorder = onSale ? warnOrange : (isLow ? barRed : gridLine);
+        Color sBorder = hasDisc ? barRed : (onSale ? warnOrange : (isLow ? barRed : gridLine));
         DrawDashboardCard(skuBox, hSku ? cardHover : inputDark, sBorder, 0.2f, hSku);
 
         Color pCol = (mPct > 4.0f) ? warnOrange : ((mPct < -2.0f) ? textGreen : highlightCyan);
@@ -702,14 +1031,18 @@ void UpdateAndDrawUI(InventoryItem inventory[], int *itemCount, OrderRecord orde
         {
             DrawTextTruncated(inventory[i].name, (int)skuBox.x + 12, (int)skuBox.y + 8, 16, 150, onSale ? warnOrange : textYellow);
             DrawTextTruncated(TextFormat("EUR %.0f (%+.0f%%)", dispP, mPct), (int)skuBox.x + 168, (int)skuBox.y + 8, 14, 118, pCol);
-            DrawTextTruncated(TextFormat("Stock: %d/%d (+%d Transit)", inventory[i].quantity, inventory[i].maxStock, inventory[i].inTransit),
-                              (int)skuBox.x + 12, (int)skuBox.y + 28, 14, 268, isLow ? barRed : textDim);
+            DrawTextTruncated(hasDisc
+                                  ? TextFormat("Stock: %d (Book:%d) [%s]", inventory[i].quantity, inventory[i].expectedQty, inventory[i].barcode)
+                                  : TextFormat("Stock: %d/%d [%s]", inventory[i].quantity, inventory[i].maxStock, inventory[i].barcode),
+                              (int)skuBox.x + 12, (int)skuBox.y + 28, 13, 268, hasDisc ? barRed : (isLow ? barRed : textDim));
         }
         else
         {
             DrawTextTruncated(inventory[i].name, (int)skuBox.x + 8, (int)skuBox.y + 6, 14, 126, onSale ? warnOrange : textYellow);
-            DrawTextTruncated(TextFormat("%d/%d %+.0f%%", inventory[i].quantity, inventory[i].maxStock, mPct),
-                              (int)skuBox.x + 8, (int)skuBox.y + 26, 13, 126, isLow ? barRed : pCol);
+            DrawTextTruncated(hasDisc
+                                  ? TextFormat("%d vs %d! (%+.0f%%)", inventory[i].quantity, inventory[i].expectedQty, mPct)
+                                  : TextFormat("%d/%d %+.0f%%", inventory[i].quantity, inventory[i].maxStock, mPct),
+                              (int)skuBox.x + 8, (int)skuBox.y + 26, 13, 126, (hasDisc || isLow) ? barRed : pCol);
         }
 
         float r = inventory[i].maxStock > 0 ? (float)inventory[i].quantity / (float)inventory[i].maxStock : 0.0f;
@@ -733,7 +1066,7 @@ void UpdateAndDrawUI(InventoryItem inventory[], int *itemCount, OrderRecord orde
         if (hSku && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT))
         {
             selectedGraphSku = i;
-            catalogShowGraph = true;
+            catalogViewMode = 1;
             currentScreen = SCREEN_VIEW;
         }
         leftSkusDrawn++;
@@ -905,160 +1238,281 @@ void UpdateAndDrawUI(InventoryItem inventory[], int *itemCount, OrderRecord orde
         DrawRectangleRounded(centerArena, 0.02f, 12, (Color){11, 14, 22, 248});
         DrawRectangleLinesEx(centerArena, 2.0f, highlightCyan);
 
-        Rectangle closeBtn = {centerArena.x + 968, centerArena.y + 14, 224, 40};
+        Rectangle closeBtn = {centerArena.x + 980, centerArena.y + 14, 212, 40};
         bool hClose = CheckCollisionPointRec(mousePoint, closeBtn);
         DrawDashboardCard(closeBtn, hClose ? highlightCyan : inputDark, highlightCyan, 0.3f, hClose);
-        DrawTextCenteredInBox(closeBtn, "< RETURN TO LIVE ARENA", 16, hClose ? bgDark : textYellow);
+        DrawTextCenteredInBox(closeBtn, "< RETURN TO ARENA", 15, hClose ? bgDark : textYellow);
         if (hClose && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
         {
             currentScreen = SCREEN_MENU;
-            showItemFormModal = false;
+            searchBoxFocused = false;
+            scraperBoxFocused = false;
         }
 
         switch (currentScreen)
         {
         // -----------------------------------------------------------------
-        // 1080P CATALOG TABLE & MULTI-LINE TELEMETRY GRAPH (SCREEN_VIEW)
+        // 1080P CATALOG, BARCODE SEARCH, GRAPH & STAFF AUDIT (SCREEN_VIEW)
         // -----------------------------------------------------------------
         case SCREEN_VIEW:
         {
-            DrawTextTruncated(catalogShowGraph
-                                  ? "NDAL PRODUCT TELEMETRY & ELASTICITY GRAPH"
-                                  : TextFormat("NDAL PRODUCT CATALOG (%d / %d MAX SKUs)", activeStock, MAX_STORE_SKUS),
-                              (int)centerArena.x + 24, (int)centerArena.y + 22, 22, 520, textYellow);
+            // Top Mode Tabs
+            Rectangle tabCat = {centerArena.x + 24, centerArena.y + 14, 235, 40};
+            Rectangle tabGrf = {centerArena.x + 269, centerArena.y + 14, 220, 40};
+            Rectangle tabAud = {centerArena.x + 499, centerArena.y + 14, 275, 40};
+            Rectangle tabScr = {centerArena.x + 784, centerArena.y + 14, 184, 40};
 
-            Rectangle modeBtn = {centerArena.x + 560, centerArena.y + 14, 200, 40};
-            bool hMode = CheckCollisionPointRec(mousePoint, modeBtn);
-            DrawDashboardCard(modeBtn, catalogShowGraph ? highlightCyan : (hMode ? cardHover : inputDark), highlightCyan, 0.3f, hMode);
-            DrawTextCenteredInBox(modeBtn, catalogShowGraph ? "<= TABLE CATALOG" : "ANALYTICS GRAPH", 16, catalogShowGraph ? bgDark : highlightCyan);
-            if (hMode && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+            bool hTC = CheckCollisionPointRec(mousePoint, tabCat);
+            bool hTG = CheckCollisionPointRec(mousePoint, tabGrf);
+            bool hTA = CheckCollisionPointRec(mousePoint, tabAud);
+            bool hTS = CheckCollisionPointRec(mousePoint, tabScr);
+
+            DrawDashboardCard(tabCat, catalogViewMode == 0 ? highlightCyan : (hTC ? cardHover : inputDark), highlightCyan, 0.3f, hTC);
+            DrawTextCenteredInBox(tabCat, TextFormat("CATALOG & BARCODES (%d)", activeStock), 14, catalogViewMode == 0 ? bgDark : textYellow);
+
+            DrawDashboardCard(tabGrf, catalogViewMode == 1 ? highlightPurple : (hTG ? cardHover : inputDark), highlightPurple, 0.3f, hTG);
+            DrawTextCenteredInBox(tabGrf, "TELEMETRY GRAPH", 14, catalogViewMode == 1 ? bgDark : textYellow);
+
+            Color audTabCol = (discrepancySkuCount > 0) ? barRed : textGreen;
+            DrawDashboardCard(tabAud, catalogViewMode == 2 ? audTabCol : (hTA ? cardHover : inputDark), audTabCol, 0.3f, hTA);
+            DrawTextCenteredInBox(tabAud, discrepancySkuCount > 0 ? TextFormat("STAFF AUDIT (%d DISCREPANCY!)", discrepancySkuCount) : "STAFF DISCREPANCY AUDIT",
+                                  14, catalogViewMode == 2 ? bgDark : (discrepancySkuCount > 0 ? barRed : textGreen));
+
+            DrawDashboardCard(tabScr, hTS ? warnOrange : inputDark, warnOrange, 0.3f, hTS);
+            DrawTextCenteredInBox(tabScr, "STORE SCRAPER >", 14, hTS ? bgDark : warnOrange);
+
+            if (hTC && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+                catalogViewMode = 0;
+            if (hTG && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+                catalogViewMode = 1;
+            if (hTA && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+                catalogViewMode = 2;
+            if (hTS && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
             {
-                catalogShowGraph = !catalogShowGraph;
+                currentScreen = SCREEN_EVENTS;
+                eventsSubTab = 2;
             }
 
-            Rectangle topActBtn = {centerArena.x + 772, centerArena.y + 14, 180, 40};
-            bool hTopAct = CheckCollisionPointRec(mousePoint, topActBtn);
-            if (!catalogShowGraph)
-            {
-                bool canAddMore = (activeStock < MAX_STORE_SKUS);
-                Color addCol = canAddMore ? highlightPurple : textDim;
-                DrawDashboardCard(topActBtn, (hTopAct && canAddMore) ? highlightPurple : inputDark, addCol, 0.3f, hTopAct && canAddMore);
-                DrawTextCenteredInBox(topActBtn, canAddMore ? "+ ADD NEW SKU" : "MAX 12 SKUs FULL", 15, canAddMore ? textYellow : textDim);
-                if (hTopAct && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
-                {
-                    if (canAddMore)
-                    {
-                        currentScreen = SCREEN_EVENTS;
-                        showItemFormModal = true;
-                        editTargetIndex = -1;
-                        nameInput[0] = '\0';
-                        qtyInput[0] = '\0';
-                        priceInput[0] = '\0';
-                        costInput[0] = '\0';
-                        maxInput[0] = '\0';
-                        minInput[0] = '\0';
-                        nameCount = qtyCount = priceCount = costCount = maxCount = minCount = 0;
-                    }
-                    else
-                    {
-                        PushNotification("MAX CAPACITY: 12 Active SKUs reached! Delete or Edit an existing SKU first.", 2);
-                    }
-                }
-            }
-            else
-            {
-                DrawDashboardCard(topActBtn, hTopAct ? warnOrange : inputDark, warnOrange, 0.3f, hTopAct);
-                DrawTextCenteredInBox(topActBtn, "TRIGGER FLASH SALE", 15, hTopAct ? bgDark : warnOrange);
-                if (hTopAct && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
-                {
-                    inventory[selectedGraphSku].saleTimer = 20.0f;
-                    RecordSkuTelemetrySample(selectedGraphSku, &inventory[selectedGraphSku], ai->simTime);
-                    PushNotification(TextFormat("FLASH SALE triggered on %s!", inventory[selectedGraphSku].name), 2);
-                }
-            }
-
-            if (catalogShowGraph)
+            if (catalogViewMode == 1)
             {
                 DrawProductAnalyticsGraph(centerArena, mousePoint, inventory, *itemCount);
             }
+            else if (catalogViewMode == 2)
+            {
+                DrawStaffDiscrepancyAuditView(centerArena, mousePoint, wheel, inventory, *itemCount);
+            }
             else
             {
+                // --- SEARCH & SIMULATED BARCODE SCANNER BAR ---
+                float sBarY = centerArena.y + 66.0f;
+                Rectangle searchBox = {centerArena.x + 24, sBarY, 560, 40};
+                Rectangle clearSearchBtn = {centerArena.x + 594, sBarY, 96, 40};
+                Rectangle simScanBtn = {centerArena.x + 700, sBarY, 270, 40};
+                Rectangle addNewBtn = {centerArena.x + 980, sBarY, 212, 40};
+
+                if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+                {
+                    searchBoxFocused = CheckCollisionPointRec(mousePoint, searchBox);
+                }
+
+                if (searchBoxFocused)
+                {
+                    int key = GetCharPressed();
+                    while (key > 0)
+                    {
+                        if (key >= 32 && key <= 125 && searchLen < 44)
+                        {
+                            searchQuery[searchLen++] = (char)key;
+                            searchQuery[searchLen] = '\0';
+                            scrollIndex = 0;
+                        }
+                        key = GetCharPressed();
+                    }
+                    if (IsKeyPressed(KEY_BACKSPACE) && searchLen > 0)
+                    {
+                        searchQuery[--searchLen] = '\0';
+                        scrollIndex = 0;
+                    }
+                }
+
+                DrawDashboardCard(searchBox, inputDark, searchBoxFocused ? highlightCyan : gridLine, 0.25f, searchBoxFocused);
+                DrawTextTruncated(searchLen > 0 ? TextFormat("SEARCH / BARCODE: %s_", searchQuery) : "CLICK TO SEARCH BY PRODUCT NAME OR EAN-13 BARCODE...",
+                                  (int)searchBox.x + 16, (int)searchBox.y + 12, 15, 530, searchLen > 0 ? highlightCyan : textDim);
+
+                bool hClr = CheckCollisionPointRec(mousePoint, clearSearchBtn);
+                DrawDashboardCard(clearSearchBtn, hClr ? barRed : inputDark, gridLine, 0.25f, hClr);
+                DrawTextCenteredInBox(clearSearchBtn, "CLEAR", 14, hClr ? bgDark : textYellow);
+                if (hClr && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+                {
+                    searchQuery[0] = '\0';
+                    searchLen = 0;
+                    scrollIndex = 0;
+                }
+
+                bool hScan = CheckCollisionPointRec(mousePoint, simScanBtn);
+                DrawDashboardCard(simScanBtn, hScan ? highlightPurple : inputDark, highlightPurple, 0.25f, hScan);
+                DrawTextCenteredInBox(simScanBtn, "SIMULATE BARCODE SCAN", 14, hScan ? bgDark : highlightPurple);
+                if (hScan && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+                {
+                    int targetIdx = -1;
+                    // Prefer scanning an item with a discrepancy first, else random active item
+                    for (int i = 0; i < MAX_ITEMS; i++)
+                    {
+                        if (inventory[i].isActive && inventory[i].quantity != inventory[i].expectedQty)
+                        {
+                            targetIdx = i;
+                            break;
+                        }
+                    }
+                    if (targetIdx == -1)
+                        targetIdx = PickRandomActiveInventoryIndex(inventory);
+
+                    if (inventory[targetIdx].isActive)
+                    {
+                        strncpy(searchQuery, inventory[targetIdx].barcode, 44);
+                        searchLen = (int)strlen(searchQuery);
+                        barcodeScanLaserFlash = 1.6f;
+                        scrollIndex = 0;
+                        PushNotification(TextFormat("BARCODE SCANNED: [%s] -> %s (Shelf: %d | Book: %d)",
+                                                    inventory[targetIdx].barcode, inventory[targetIdx].name,
+                                                    inventory[targetIdx].quantity, inventory[targetIdx].expectedQty),
+                                         0);
+                    }
+                }
+
+                bool canAddMore = (activeStock < MAX_STORE_SKUS);
+                bool hAddN = CheckCollisionPointRec(mousePoint, addNewBtn);
+                DrawDashboardCard(addNewBtn, (hAddN && canAddMore) ? textGreen : inputDark, canAddMore ? textGreen : gridLine, 0.25f, hAddN && canAddMore);
+                DrawTextCenteredInBox(addNewBtn, canAddMore ? "+ ADD NEW SKU" : "MAX 12 SKUS FULL", 14, (hAddN && canAddMore) ? bgDark : (canAddMore ? textGreen : textDim));
+                if (hAddN && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && canAddMore)
+                {
+                    currentScreen = SCREEN_EVENTS;
+                    eventsSubTab = 1;
+                    editTargetIndex = -1;
+                    nameInput[0] = qtyInput[0] = priceInput[0] = costInput[0] = maxInput[0] = minInput[0] = '\0';
+                    nameCount = qtyCount = priceCount = costCount = maxCount = minCount = 0;
+                }
+
+                // Count matching items for scroll clamping
+                int matchingCount = 0;
+                for (int i = 0; i < MAX_ITEMS; i++)
+                {
+                    if (ItemMatchesSearch(&inventory[i], searchQuery))
+                        matchingCount++;
+                }
+
                 if (wheel != 0)
                     scrollIndex -= wheel;
-                if (scrollIndex > activeStock - 8)
-                    scrollIndex = activeStock - 8;
+                if (scrollIndex > matchingCount - 7)
+                    scrollIndex = matchingCount - 7;
                 if (scrollIndex < 0)
                     scrollIndex = 0;
 
-                int yOff = (int)centerArena.y + 76;
-                DrawTextTruncated("PRODUCT & WHOLESALE COST", (int)centerArena.x + 32, yOff, 15, 290, textDim);
-                DrawTextTruncated("STOCK (+TRANSIT)", (int)centerArena.x + 340, yOff, 15, 190, textDim);
-                DrawTextTruncated("AI RETAIL PRICE (MARKUP)", (int)centerArena.x + 545, yOff, 15, 230, textDim);
-                DrawTextTruncated("TELEMETRY & CATALOG ACTIONS", (int)centerArena.x + 790, yOff, 15, 390, textDim);
-                yOff += 26;
+                int yOff = (int)centerArena.y + 118;
+                DrawTextTruncated("BARCODE & PRODUCT DETAILS", (int)centerArena.x + 32, yOff, 14, 340, textDim);
+                DrawTextTruncated("PHYSICAL vs BOOK STOCK", (int)centerArena.x + 390, yOff, 14, 210, textDim);
+                DrawTextTruncated("AI RETAIL PRICE (MARKUP)", (int)centerArena.x + 615, yOff, 14, 210, textDim);
+                DrawTextTruncated("TELEMETRY, AUDIT & ACTIONS", (int)centerArena.x + 835, yOff, 14, 350, textDim);
+                yOff += 22;
                 DrawLine((int)centerArena.x + 24, yOff, (int)centerArena.x + 1192, yOff, gridLine);
-                yOff += 12;
+                yOff += 8;
 
-                int actIdx = 0, drawn = 0;
+                int matchIdx = 0, drawn = 0;
                 for (int i = 0; i < MAX_ITEMS; i++)
                 {
-                    if (inventory[i].isActive)
+                    if (ItemMatchesSearch(&inventory[i], searchQuery))
                     {
-                        if (actIdx >= scrollIndex && drawn < 8)
+                        if (matchIdx >= scrollIndex && drawn < 7)
                         {
-                            Rectangle row = {centerArena.x + 24, (float)yOff, 1168, 76};
-                            DrawDashboardCard(row, (drawn % 2 == 0) ? cardDark : inputDark, gridLine, 0.15f, false);
+                            int diff = inventory[i].quantity - inventory[i].expectedQty;
+                            Rectangle row = {centerArena.x + 24, (float)yOff, 1168, 82};
+                            DrawDashboardCard(row, (drawn % 2 == 0) ? cardDark : inputDark, diff != 0 ? barRed : gridLine, 0.15f, false);
+
+                            // 1D Barcode Graphic + Product Title
+                            DrawSimulatedBarcode((Rectangle){row.x + 12, row.y + 10, 118, 62}, inventory[i].barcode, highlightCyan);
 
                             float elast = GetItemPriceElasticity(i);
                             float mPct = (ai->aiPriceMult[i] - 1.0f) * 100.0f;
 
-                            DrawTextTruncated(inventory[i].name, (int)row.x + 16, yOff + 12, 20, 280, textYellow);
-                            DrawTextTruncated(TextFormat("Cost: EUR %.0f  |  Min:%d Max:%d  |  Vel: %.2fx",
+                            DrawTextTruncated(inventory[i].name, (int)row.x + 142, yOff + 14, 19, 235, textYellow);
+                            DrawTextTruncated(TextFormat("Cost: EUR %.0f | Min:%d Max:%d | Vel:%.2fx",
                                                          inventory[i].orderCost, inventory[i].minStock, inventory[i].maxStock, elast),
-                                              (int)row.x + 16, yOff + 42, 14, 290, textDim);
+                                              (int)row.x + 142, yOff + 44, 13, 240, textDim);
 
-                            DrawTextTruncated(TextFormat("%d / %d (+%d)", inventory[i].quantity, inventory[i].maxStock, inventory[i].inTransit),
-                                              (int)centerArena.x + 340, yOff + 14, 18, 180, inventory[i].quantity == 0 ? barRed : textYellow);
-                            float fillR = inventory[i].maxStock > 0 ? (float)inventory[i].quantity / (float)inventory[i].maxStock : 0.0f;
-                            if (fillR > 1.0f)
-                                fillR = 1.0f;
-                            Rectangle sTrack = {centerArena.x + 340, (float)yOff + 44, 165, 10};
-                            DrawRectangleRounded(sTrack, 1.0f, 6, bgDark);
-                            if (fillR > 0.02f)
+                            // Stock + Discrepancy Status
+                            DrawTextTruncated(TextFormat("Shelf: %d/%d (+%d) | Book: %d",
+                                                         inventory[i].quantity, inventory[i].maxStock, inventory[i].inTransit, inventory[i].expectedQty),
+                                              (int)centerArena.x + 390, yOff + 14, 15, 215, (inventory[i].quantity == 0 || diff != 0) ? barRed : textYellow);
+
+                            if (diff != 0)
                             {
-                                Color bCol = (inventory[i].quantity <= inventory[i].minStock) ? barRed : highlightCyan;
-                                DrawRectangleRounded((Rectangle){sTrack.x, sTrack.y, 165 * fillR, 10}, 1.0f, 6, bCol);
+                                DrawPillBadge((Rectangle){centerArena.x + 390, (float)yOff + 42, 195, 24},
+                                              TextFormat("DISCREPANCY: %+d UNITS!", diff), barRed, bgDark);
+                            }
+                            else
+                            {
+                                float fillR = inventory[i].maxStock > 0 ? (float)inventory[i].quantity / (float)inventory[i].maxStock : 0.0f;
+                                if (fillR > 1.0f)
+                                    fillR = 1.0f;
+                                Rectangle sTrack = {centerArena.x + 390, (float)yOff + 48, 185, 10};
+                                DrawRectangleRounded(sTrack, 1.0f, 6, bgDark);
+                                if (fillR > 0.02f)
+                                {
+                                    Color bCol = (inventory[i].quantity <= inventory[i].minStock) ? barRed : highlightCyan;
+                                    DrawRectangleRounded((Rectangle){sTrack.x, sTrack.y, 185 * fillR, 10}, 1.0f, 6, bCol);
+                                }
                             }
 
+                            // Price & Margin
                             float dispP = (inventory[i].saleTimer > 0) ? (inventory[i].price * 0.88f) : inventory[i].price;
                             Color pCol = (mPct > 4.0f) ? warnOrange : ((mPct < -2.0f) ? textGreen : highlightCyan);
                             float uProf = dispP - GetEffectiveUnitCost(&inventory[i], ev->subsidyTimer);
                             DrawTextTruncated(TextFormat("EUR %.2f (%+.1f%%)", dispP, mPct),
-                                              (int)centerArena.x + 545, yOff + 16, 19, 230, pCol);
+                                              (int)centerArena.x + 615, yOff + 16, 18, 205, pCol);
                             DrawTextTruncated(TextFormat("Net Margin: %+.1f / u", uProf),
-                                              (int)centerArena.x + 545, yOff + 42, 14, 230, uProf >= 0 ? textGreen : barRed);
+                                              (int)centerArena.x + 615, yOff + 44, 14, 205, uProf >= 0 ? textGreen : barRed);
 
-                            Rectangle graphBtn = {centerArena.x + 786, (float)yOff + 18, 104, 40};
-                            Rectangle saleBtn = {centerArena.x + 898, (float)yOff + 18, 114, 40};
-                            Rectangle editBtn = {centerArena.x + 1020, (float)yOff + 18, 76, 40};
-                            Rectangle delBtn = {centerArena.x + 1104, (float)yOff + 18, 72, 40};
+                            // Action Buttons
+                            Rectangle graphBtn = {centerArena.x + 830, (float)yOff + 20, 82, 40};
+                            Rectangle auditBtn = {centerArena.x + 918, (float)yOff + 20, 92, 40};
+                            Rectangle saleBtn = {centerArena.x + 1016, (float)yOff + 20, 86, 40};
+                            Rectangle editBtn = {centerArena.x + 1108, (float)yOff + 20, 72, 40};
 
                             bool hGrf = CheckCollisionPointRec(mousePoint, graphBtn);
+                            bool hAud = CheckCollisionPointRec(mousePoint, auditBtn);
                             bool hSale = CheckCollisionPointRec(mousePoint, saleBtn);
                             bool hEdit = CheckCollisionPointRec(mousePoint, editBtn);
-                            bool hDel = CheckCollisionPointRec(mousePoint, delBtn);
                             bool onSale = (inventory[i].saleTimer > 0.0f);
 
                             DrawDashboardCard(graphBtn, hGrf ? highlightCyan : cardDark, highlightCyan, 0.3f, hGrf);
-                            DrawTextCenteredInBox(graphBtn, "GRAPH", 14, hGrf ? bgDark : highlightCyan);
+                            DrawTextCenteredInBox(graphBtn, "GRAPH", 13, hGrf ? bgDark : highlightCyan);
                             if (hGrf && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
                             {
                                 selectedGraphSku = i;
-                                catalogShowGraph = true;
+                                catalogViewMode = 1;
+                            }
+
+                            Color aCol = (diff != 0) ? barRed : textGreen;
+                            DrawDashboardCard(auditBtn, hAud ? aCol : cardDark, aCol, 0.3f, hAud);
+                            DrawTextCenteredInBox(auditBtn, diff != 0 ? "FIX AUDIT" : "AUDIT OK", 13, hAud ? bgDark : aCol);
+                            if (hAud && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+                            {
+                                if (diff != 0)
+                                {
+                                    RecordStaffAudit(staffDirectory[selectedStaffIdx], &inventory[i], auditReasons[selectedReasonIdx], ai->simTime);
+                                    SaveInventory(inventory, *itemCount);
+                                    PushNotification(TextFormat("STAFF AUDIT: %s reconciled %s (%+d u)",
+                                                                staffDirectory[selectedStaffIdx], inventory[i].name, diff),
+                                                     1);
+                                }
+                                else
+                                {
+                                    catalogViewMode = 2;
+                                }
                             }
 
                             DrawDashboardCard(saleBtn, onSale ? warnOrange : (hSale ? warnOrange : cardDark), warnOrange, 0.3f, hSale);
-                            DrawTextCenteredInBox(saleBtn, onSale ? TextFormat("SALE %.0fs", inventory[i].saleTimer) : "FLASH SALE", 14, (onSale || hSale) ? bgDark : warnOrange);
+                            DrawTextCenteredInBox(saleBtn, onSale ? TextFormat("%.0fs", inventory[i].saleTimer) : "SALE", 13, (onSale || hSale) ? bgDark : warnOrange);
                             if (hSale && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
                             {
                                 inventory[i].saleTimer = 20.0f;
@@ -1067,11 +1521,11 @@ void UpdateAndDrawUI(InventoryItem inventory[], int *itemCount, OrderRecord orde
                             }
 
                             DrawDashboardCard(editBtn, hEdit ? highlightPurple : cardDark, highlightPurple, 0.3f, hEdit);
-                            DrawTextCenteredInBox(editBtn, "EDIT", 14, textYellow);
+                            DrawTextCenteredInBox(editBtn, "EDIT", 13, textYellow);
                             if (hEdit && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
                             {
                                 currentScreen = SCREEN_EVENTS;
-                                showItemFormModal = true;
+                                eventsSubTab = 1;
                                 editTargetIndex = i;
                                 strcpy(nameInput, inventory[i].name);
                                 nameCount = (int)strlen(nameInput);
@@ -1087,26 +1541,10 @@ void UpdateAndDrawUI(InventoryItem inventory[], int *itemCount, OrderRecord orde
                                 minCount = (int)strlen(minInput);
                             }
 
-                            DrawDashboardCard(delBtn, hDel ? barRed : cardDark, barRed, 0.3f, hDel);
-                            DrawTextCenteredInBox(delBtn, "DEL", 14, hDel ? bgDark : barRed);
-                            if (hDel && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
-                            {
-                                if (activeStock > 1)
-                                {
-                                    inventory[i].isActive = false;
-                                    SaveInventory(inventory, *itemCount);
-                                    PushNotification(TextFormat("Removed %s from active store aisles.", inventory[i].name), 0);
-                                }
-                                else
-                                {
-                                    PushNotification("Cannot delete the last remaining active SKU!", 2);
-                                }
-                            }
-
-                            yOff += 86;
+                            yOff += 90;
                             drawn++;
                         }
-                        actIdx++;
+                        matchIdx++;
                     }
                 }
             }
@@ -1181,28 +1619,38 @@ void UpdateAndDrawUI(InventoryItem inventory[], int *itemCount, OrderRecord orde
         }
 
         // -----------------------------------------------------------------
-        // 1080P CHAOS DIRECTOR DECK & SKU EDITOR (SCREEN_EVENTS)
+        // 1080P CHAOS DECK, SKU EDITOR & SHOPIFY STORE SCRAPER (SCREEN_EVENTS)
         // -----------------------------------------------------------------
         case SCREEN_EVENTS:
         {
-            Rectangle tabChaos = {centerArena.x + 24, centerArena.y + 14, 280, 40};
-            Rectangle tabSku = {centerArena.x + 318, centerArena.y + 14, 340, 40};
+            Rectangle tabChaos = {centerArena.x + 24, centerArena.y + 14, 260, 40};
+            Rectangle tabSku = {centerArena.x + 296, centerArena.y + 14, 290, 40};
+            Rectangle tabScraper = {centerArena.x + 598, centerArena.y + 14, 360, 40};
+
             bool hT1 = CheckCollisionPointRec(mousePoint, tabChaos);
             bool hT2 = CheckCollisionPointRec(mousePoint, tabSku);
-            DrawDashboardCard(tabChaos, !showItemFormModal ? barRed : inputDark, barRed, 0.3f, hT1);
-            DrawTextCenteredInBox(tabChaos, "8 CHAOS EVENTS DECK", 16, textYellow);
-            DrawDashboardCard(tabSku, showItemFormModal ? highlightCyan : inputDark, highlightCyan, 0.3f, hT2);
-            DrawTextCenteredInBox(tabSku, TextFormat("ADD / EDIT SKU (%d/%d MAX)", activeStock, MAX_STORE_SKUS), 16, showItemFormModal ? bgDark : textYellow);
+            bool hT3 = CheckCollisionPointRec(mousePoint, tabScraper);
+
+            DrawDashboardCard(tabChaos, eventsSubTab == 0 ? barRed : inputDark, barRed, 0.3f, hT1);
+            DrawTextCenteredInBox(tabChaos, "8 CHAOS EVENTS DECK", 15, textYellow);
+
+            DrawDashboardCard(tabSku, eventsSubTab == 1 ? highlightCyan : inputDark, highlightCyan, 0.3f, hT2);
+            DrawTextCenteredInBox(tabSku, TextFormat("ADD / EDIT SKU (%d/%d)", activeStock, MAX_STORE_SKUS), 15, eventsSubTab == 1 ? bgDark : textYellow);
+
+            DrawDashboardCard(tabScraper, eventsSubTab == 2 ? warnOrange : inputDark, warnOrange, 0.3f, hT3);
+            DrawTextCenteredInBox(tabScraper, "SHOPIFY / WEB STORE SCRAPER", 15, eventsSubTab == 2 ? bgDark : warnOrange);
 
             if (hT1 && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
-                showItemFormModal = false;
+                eventsSubTab = 0;
             if (hT2 && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
             {
-                showItemFormModal = true;
+                eventsSubTab = 1;
                 editTargetIndex = -1;
             }
+            if (hT3 && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+                eventsSubTab = 2;
 
-            if (!showItemFormModal)
+            if (eventsSubTab == 0)
             {
                 const char *evTitles[8] = {
                     "1. Flash Sale Frenzy (3x SKUs)", "2. Viral Demand Surge (2.5x)",
@@ -1212,12 +1660,12 @@ void UpdateAndDrawUI(InventoryItem inventory[], int *itemCount, OrderRecord orde
                 const char *evSub[8] = {
                     "3 random SKUs on -12% sale, 2.2x demand velocity & +Satisfaction for 20s.",
                     "All active products surge to 2.5x customer buying speed for 18 seconds.",
-                    "Damages an active shipment in transit, losing 40% of units & -6% Satisfaction.",
+                    "Damages an active shipment in transit, creating a 40% Staff Audit Discrepancy.",
                     "Heavy rain & lightning slow all highway delivery trucks by 55% for 18 seconds.",
                     "Takes 1-2 suppliers offline for 22s, forcing expensive AI rerouting.",
                     "Facility utility and power bills surge 2.1x (EUR 242/8s) for 24 seconds.",
                     "Cashier & warehouse wages surge 1.85x (EUR 305/8s) and Satisfaction drops -7%.",
-                    "Theft/spoilage removes 24% stock from 2 SKUs and drops Satisfaction -8%."};
+                    "Unrecorded theft removes 24% physical stock, creating a Book vs Shelf Discrepancy."};
                 Color evCols[8] = {
                     warnOrange, barRed, barRed, highlightPurple,
                     barRed, warnOrange, warnOrange, barRed};
@@ -1242,12 +1690,12 @@ void UpdateAndDrawUI(InventoryItem inventory[], int *itemCount, OrderRecord orde
                     }
                 }
             }
-            else
+            else if (eventsSubTab == 1)
             {
                 DrawTextTruncated(editTargetIndex == -1
                                       ? TextFormat("Adding New SKU to Store Aisles (Slot %d of %d Max)", activeStock + 1, MAX_STORE_SKUS)
-                                      : TextFormat("Editing Existing SKU #%d (%s)", inventory[editTargetIndex].id, inventory[editTargetIndex].name),
-                                  (int)centerArena.x + 380, (int)centerArena.y + 72, 18, 650, highlightCyan);
+                                      : TextFormat("Editing Existing SKU #%d (%s | Barcode: %s)", inventory[editTargetIndex].id, inventory[editTargetIndex].name, inventory[editTargetIndex].barcode),
+                                  (int)centerArena.x + 380, (int)centerArena.y + 72, 18, 750, highlightCyan);
 
                 Rectangle nameBox = {centerArena.x + 380, centerArena.y + 110, 580, 54};
                 Rectangle qtyBox = {centerArena.x + 380, centerArena.y + 190, 580, 54};
@@ -1321,35 +1769,17 @@ void UpdateAndDrawUI(InventoryItem inventory[], int *itemCount, OrderRecord orde
                 if (IsKeyPressed(KEY_BACKSPACE))
                 {
                     if (activeInput == 0 && nameCount > 0)
-                    {
-                        nameCount--;
-                        nameInput[nameCount] = '\0';
-                    }
+                        nameInput[--nameCount] = '\0';
                     else if (activeInput == 1 && qtyCount > 0)
-                    {
-                        qtyCount--;
-                        qtyInput[qtyCount] = '\0';
-                    }
+                        qtyInput[--qtyCount] = '\0';
                     else if (activeInput == 2 && priceCount > 0)
-                    {
-                        priceCount--;
-                        priceInput[priceCount] = '\0';
-                    }
+                        priceInput[--priceCount] = '\0';
                     else if (activeInput == 3 && costCount > 0)
-                    {
-                        costCount--;
-                        costInput[costCount] = '\0';
-                    }
+                        costInput[--costCount] = '\0';
                     else if (activeInput == 4 && maxCount > 0)
-                    {
-                        maxCount--;
-                        maxInput[maxCount] = '\0';
-                    }
+                        maxInput[--maxCount] = '\0';
                     else if (activeInput == 5 && minCount > 0)
-                    {
-                        minCount--;
-                        minInput[minCount] = '\0';
-                    }
+                        minInput[--minCount] = '\0';
                 }
 
                 DrawTextTruncated("Product Name", (int)centerArena.x + 110, (int)nameBox.y + 16, 20, 250, textDim);
@@ -1377,7 +1807,7 @@ void UpdateAndDrawUI(InventoryItem inventory[], int *itemCount, OrderRecord orde
                 bool canSave = (editTargetIndex >= 0) || (activeStock < MAX_STORE_SKUS);
                 bool hSave = CheckCollisionPointRec(mousePoint, saveBtn);
                 DrawDashboardCard(saveBtn, !canSave ? inputDark : (hSave ? highlightCyan : highlightPurple), canSave ? highlightCyan : barRed, 0.25f, hSave && canSave);
-                DrawTextCenteredInBox(saveBtn, canSave ? "SAVE PRODUCT SKU TO NDAL AISLES" : "MAX 12 ACTIVE SKUS REACHED", 20, (hSave && canSave) ? bgDark : textYellow);
+                DrawTextCenteredInBox(saveBtn, canSave ? "SAVE PRODUCT SKU & GENERATE BARCODE" : "MAX 12 ACTIVE SKUS REACHED", 20, (hSave && canSave) ? bgDark : textYellow);
 
                 if (hSave && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && nameCount > 0)
                 {
@@ -1404,6 +1834,7 @@ void UpdateAndDrawUI(InventoryItem inventory[], int *itemCount, OrderRecord orde
                         {
                             inventory[idx].id = idx + 1;
                             strcpy(inventory[idx].name, nameInput);
+                            GenerateSimulatedBarcode(inventory[idx].id, inventory[idx].name, inventory[idx].barcode);
                             inventory[idx].orderCost = (float)atof(costInput);
                             if (inventory[idx].orderCost <= 1.0f)
                                 inventory[idx].orderCost = 65.0f;
@@ -1417,6 +1848,7 @@ void UpdateAndDrawUI(InventoryItem inventory[], int *itemCount, OrderRecord orde
                             inventory[idx].quantity = atoi(qtyInput) > 0 ? atoi(qtyInput) : (inventory[idx].minStock + 3);
                             if (inventory[idx].quantity > inventory[idx].maxStock)
                                 inventory[idx].quantity = inventory[idx].maxStock;
+                            inventory[idx].expectedQty = inventory[idx].quantity;
                             inventory[idx].inTransit = 0;
                             inventory[idx].baseDemandRate = 0.28f;
                             inventory[idx].saleTimer = 0.0f;
@@ -1426,12 +1858,13 @@ void UpdateAndDrawUI(InventoryItem inventory[], int *itemCount, OrderRecord orde
                             ClearSkuTelemetry(idx);
                             RecordSkuTelemetrySample(idx, &inventory[idx], ai->simTime);
                             SpawnShopperAgent(idx, 1, inventory[idx].price, 0.0f, inventory[idx].quantity == 0);
-                            PushNotification(TextFormat("Added '%s' to live store aisles (%d/%d SKUs)!", inventory[idx].name, activeStock + 1, MAX_STORE_SKUS), 1);
+                            PushNotification(TextFormat("Added '%s' [%s] to live store aisles!", inventory[idx].name, inventory[idx].barcode), 1);
                         }
                     }
                     else if (editTargetIndex >= 0)
                     {
                         strcpy(inventory[editTargetIndex].name, nameInput);
+                        GenerateSimulatedBarcode(inventory[editTargetIndex].id, inventory[editTargetIndex].name, inventory[editTargetIndex].barcode);
                         inventory[editTargetIndex].orderCost = (float)atof(costInput);
                         if (inventory[editTargetIndex].orderCost <= 1.0f)
                             inventory[editTargetIndex].orderCost = 65.0f;
@@ -1443,12 +1876,107 @@ void UpdateAndDrawUI(InventoryItem inventory[], int *itemCount, OrderRecord orde
                         {
                             inventory[editTargetIndex].quantity = inventory[editTargetIndex].maxStock;
                         }
+                        inventory[editTargetIndex].expectedQty = inventory[editTargetIndex].quantity;
                         ResetSkuFairPrice(editTargetIndex, &inventory[editTargetIndex], false);
                         RecordSkuTelemetrySample(editTargetIndex, &inventory[editTargetIndex], ai->simTime);
                     }
                     SaveInventory(inventory, *itemCount);
-                    showItemFormModal = false;
-                    currentScreen = SCREEN_MENU;
+                    currentScreen = SCREEN_VIEW;
+                    catalogViewMode = 0;
+                }
+            }
+            else if (eventsSubTab == 2)
+            {
+                // --- SHOPIFY / ONLINE STORE JSON SCRAPER PANEL ---
+                Rectangle heroCard = {centerArena.x + 24, centerArena.y + 74, 1168, 220};
+                DrawDashboardCard(heroCard, cardDark, warnOrange, 0.08f, false);
+
+                DrawTextTruncated("SHOPIFY /products.json & PUBLIC E-COMMERCE API INVENTORY SCRAPER",
+                                  (int)heroCard.x + 24, (int)heroCard.y + 18, 22, 1100, warnOrange);
+                DrawTextTruncated("Automatically scrapes live product titles & retail prices from any Shopify store (/products.json) or JSON endpoint,",
+                                  (int)heroCard.x + 24, (int)heroCard.y + 52, 16, 1120, textYellow);
+                DrawTextTruncated("calculates wholesale supplier costs, assigns EAN-13 barcodes, and populates inventory_db.csv.",
+                                  (int)heroCard.x + 24, (int)heroCard.y + 76, 16, 1120, textDim);
+
+                Rectangle urlBox = {heroCard.x + 24, heroCard.y + 114, 790, 50};
+                Rectangle scrapeNowBtn = {heroCard.x + 830, heroCard.y + 114, 314, 50};
+
+                if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+                {
+                    scraperBoxFocused = CheckCollisionPointRec(mousePoint, urlBox);
+                }
+                if (scraperBoxFocused)
+                {
+                    int key = GetCharPressed();
+                    while (key > 0)
+                    {
+                        if (key >= 32 && key <= 125 && scraperUrlLen < 120)
+                        {
+                            scraperUrlInput[scraperUrlLen++] = (char)key;
+                            scraperUrlInput[scraperUrlLen] = '\0';
+                        }
+                        key = GetCharPressed();
+                    }
+                    if (IsKeyPressed(KEY_BACKSPACE) && scraperUrlLen > 0)
+                    {
+                        scraperUrlInput[--scraperUrlLen] = '\0';
+                    }
+                }
+
+                DrawDashboardCard(urlBox, inputDark, scraperBoxFocused ? highlightCyan : gridLine, 0.25f, scraperBoxFocused);
+                DrawTextTruncated(TextFormat("STORE URL: %s_", scraperUrlInput), (int)urlBox.x + 18, (int)urlBox.y + 16, 18, 755, highlightCyan);
+
+                bool hScrNow = CheckCollisionPointRec(mousePoint, scrapeNowBtn);
+                DrawDashboardCard(scrapeNowBtn, hScrNow ? textGreen : inputDark, textGreen, 0.28f, hScrNow);
+                DrawTextCenteredInBox(scrapeNowBtn, "SCRAPE LIVE STORE JSON", 16, hScrNow ? bgDark : textGreen);
+
+                if (hScrNow && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+                {
+                    ScrapeOnlineStoreInventory(inventory, itemCount, scraperUrlInput, 0, scraperStatusMsg, sizeof(scraperStatusMsg));
+                    InitAiEconomy(inventory, itemCount);
+                    InitTelemetry(inventory);
+                    PushNotification(scraperStatusMsg, 1);
+                }
+
+                DrawTextTruncated(scraperStatusMsg, (int)heroCard.x + 24, (int)heroCard.y + 180, 15, 1120, highlightCyan);
+
+                // 4 One-Click Store Presets
+                const char *pTitles[4] = {
+                    "1. Keychron Shopify Store (/products.json)",
+                    "2. DummyJSON Global Tech Store API",
+                    "3. Shopify Streetwear & Sneaker Boutique",
+                    "4. Restore Default NDAL PC Hardware (6 SKUs)"};
+                const char *pDescs[4] = {
+                    "Scrapes mechanical keyboards, mice & switches from keychron.com/products.json",
+                    "Pulls consumer electronics & gadgets from dummyjson.com/products?limit=12",
+                    "Imports 8 curated apparel & sneaker SKUs with retail/wholesale margins & barcodes",
+                    "Resets inventory_db.csv back to the original 6 NDAL PC hardware components"};
+                Color pCols[4] = {highlightCyan, highlightPurple, warnOrange, textGreen};
+
+                for (int p = 0; p < 4; p++)
+                {
+                    int col = p % 2, row = p / 2;
+                    Rectangle pCard = {centerArena.x + 24 + col * 592, centerArena.y + 314 + row * 228, 576, 208};
+                    bool hp = CheckCollisionPointRec(mousePoint, pCard);
+                    DrawDashboardCard(pCard, hp ? cardHover : cardDark, pCols[p], 0.1f, hp);
+
+                    DrawTextTruncated(pTitles[p], (int)pCard.x + 22, (int)pCard.y + 20, 20, 530, pCols[p]);
+                    DrawTextTruncated(pDescs[p], (int)pCard.x + 22, (int)pCard.y + 58, 15, 530, textYellow);
+                    DrawTextTruncated("Auto-generates EAN-13 Barcodes, Book Stock & AI Elasticity Baselines", (int)pCard.x + 22, (int)pCard.y + 88, 14, 530, textDim);
+
+                    Rectangle loadBtn = {pCard.x + 22, pCard.y + 136, 532, 48};
+                    DrawDashboardCard(loadBtn, hp ? pCols[p] : inputDark, pCols[p], 0.3f, hp);
+                    DrawTextCenteredInBox(loadBtn, "IMPORT STORE CATALOG & LAUNCH SIMULATION", 16, hp ? bgDark : textYellow);
+
+                    if (hp && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+                    {
+                        ScrapeOnlineStoreInventory(inventory, itemCount, NULL, p + 1, scraperStatusMsg, sizeof(scraperStatusMsg));
+                        InitAiEconomy(inventory, itemCount);
+                        InitTelemetry(inventory);
+                        PushNotification(scraperStatusMsg, 1);
+                        currentScreen = SCREEN_VIEW;
+                        catalogViewMode = 0;
+                    }
                 }
             }
             break;

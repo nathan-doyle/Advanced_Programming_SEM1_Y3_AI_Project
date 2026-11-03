@@ -93,6 +93,8 @@ void UpdateActiveOrders(float dt, float weatherDelayTimer, InventoryItem invento
                         if (inventory[i].isActive && inventory[i].id == orders[o].items[b].itemId)
                         {
                             int orderedQty = orders[o].items[b].orderQuantity;
+                            int prevDiscrepancy = inventory[i].quantity - inventory[i].expectedQty;
+
                             inventory[i].inTransit -= orderedQty;
                             if (inventory[i].inTransit < 0)
                                 inventory[i].inTransit = 0;
@@ -108,6 +110,16 @@ void UpdateActiveOrders(float dt, float weatherDelayTimer, InventoryItem invento
                             {
                                 inventory[i].quantity = inventory[i].maxStock;
                             }
+
+                            // Book stock expects the full invoice unless reconciled by staff
+                            if (orders[o].isDamaged)
+                            {
+                                inventory[i].expectedQty = inventory[i].quantity - prevDiscrepancy + (orderedQty - receivedQty);
+                            }
+                            else
+                            {
+                                inventory[i].expectedQty = inventory[i].quantity - prevDiscrepancy;
+                            }
                             totalArrived += receivedQty;
                         }
                     }
@@ -117,8 +129,8 @@ void UpdateActiveOrders(float dt, float weatherDelayTimer, InventoryItem invento
 
                 if (orders[o].isDamaged)
                 {
-                    PushNotification(TextFormat("Order #%d arrived DAMAGED! +%d units (%d lost)", orders[o].orderId, totalArrived, totalLost), 2);
-                    SpawnFloatingPopup(480.0f, 345.0f, TextFormat("DAMAGED! -%d UNITS", totalLost), (Color){255, 80, 100, 255});
+                    PushNotification(TextFormat("Order #%d DAMAGED! +%d u arrived (-%d u Discrepancy logged for Staff Audit)", orders[o].orderId, totalArrived, totalLost), 2);
+                    SpawnFloatingPopup(480.0f, 345.0f, TextFormat("DAMAGED! -%d DISCREPANCY", totalLost), (Color){255, 80, 100, 255});
                 }
                 else
                 {

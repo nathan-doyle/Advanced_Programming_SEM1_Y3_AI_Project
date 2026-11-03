@@ -121,6 +121,10 @@ void InitAiEconomy(InventoryItem inventory[], int *itemCount)
                 inventory[i].isActive = false;
                 continue;
             }
+            if (inventory[i].barcode[0] == '\0')
+            {
+                GenerateSimulatedBarcode(inventory[i].id, inventory[i].name, inventory[i].barcode);
+            }
             if (inventory[i].orderCost <= 1.0f)
                 inventory[i].orderCost = 70.0f;
             if (inventory[i].maxStock > 46)
@@ -138,6 +142,7 @@ void InitAiEconomy(InventoryItem inventory[], int *itemCount)
             {
                 inventory[i].quantity = targetStartQty;
             }
+            inventory[i].expectedQty = inventory[i].quantity;
 
             aiState.baseFairPrice[i] = inventory[i].orderCost * BASE_FAIR_MARGIN_MULT;
             aiState.aiPriceMult[i] = 1.00f;
@@ -260,6 +265,19 @@ void UpdateAiAndEconomyStep(float dt, InventoryItem inventory[], int *itemCount,
             {
                 int sold = (unitsWanted > inventory[i].quantity) ? inventory[i].quantity : unitsWanted;
                 inventory[i].quantity -= sold;
+                inventory[i].expectedQty -= sold;
+                if (inventory[i].expectedQty < 0)
+                    inventory[i].expectedQty = 0;
+
+                // 2% chance of an unrecorded POS self-checkout scan miss / shoplifting creating a discrepancy
+                if (inventory[i].quantity > 1 && GetRandomValue(1, 100) <= 2)
+                {
+                    inventory[i].quantity -= 1;
+                    PushNotification(TextFormat("DISCREPANCY DETECTED: POS scan variance on %s (%s)!",
+                                                inventory[i].name, inventory[i].barcode),
+                                     2);
+                }
+
                 aiState.totalUnitsSold += sold;
 
                 float effectiveSellPrice = (inventory[i].saleTimer > 0.0f) ? (inventory[i].price * 0.88f) : inventory[i].price;
@@ -436,6 +454,24 @@ void UpdateAiAndEconomyStep(float dt, InventoryItem inventory[], int *itemCount,
                         lowestTimeToStockout = timeToOut;
                 }
             }
+        }
+
+        // If approaching array capacity, prune delivered orders while keeping active/recent ones
+        if (*orderCount >= MAX_ORDERS - 5)
+        {
+            int writeIdx = 0;
+            for (int r = 0; r < *orderCount; r++)
+            {
+                if (orders[r].status != STATUS_DELIVERED || r >= *orderCount - 10)
+                {
+                    if (writeIdx != r)
+                    {
+                        orders[writeIdx] = orders[r];
+                    }
+                    writeIdx++;
+                }
+            }
+            *orderCount = writeIdx;
         }
 
         if (aiBasketCount > 0 && *orderCount < MAX_ORDERS)
